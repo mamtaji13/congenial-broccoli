@@ -1,0 +1,91 @@
+name: Build
+on:
+  workflow_dispatch:
+jobs:
+  secure-build:
+    runs-on: windows-latest
+    timeout-minutes: 360
+    env:
+      RUN_PASSWORD: ${{ secrets.RUN_PASSWORD }}
+      TS_OAUTH_CLIENT_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+      TS_OAUTH_CLIENT_SECRET: ${{ secrets.TS_OAUTH_CLIENT_SECRET }}
+      RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+      RCLONE_CONFIG: D:\rclone.conf
+      RCLONE_DRIVE_CHUNK_SIZE: 128M
+      RCLONE_STATS: 5m
+      RCLONE_STATS_LOG_LEVEL: NOTICE
+      RCLONE_STATS_ONE_LINE: true
+    steps:
+      - name: build
+        run: |
+          $deadline = (Get-Date).AddMinutes(330)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 2 -Force
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" | Out-Null
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389 remoteip=100.64.0.0/10
+          Restart-Service -Name TermService -Force
+          if ([string]::IsNullOrEmpty($env:RUN_PASSWORD)) { Write-Error "RUN_PASSWORD not set"; exit 1 }
+          if ([string]::IsNullOrEmpty($env:RCLONE_CONF)) { Write-Error "RCLONE_CONF not set"; exit 1 }
+          $securePass = ConvertTo-SecureString $env:RUN_PASSWORD -AsPlainText -Force
+          New-LocalUser -Name "run" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "run"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "run"
+          New-Item -ItemType Directory -Force -Path D:\persist, D:\backup | Out-Null
+          Invoke-WebRequest -Uri "https://github.com/rclone/rclone/releases/download/v1.75.2/rclone-v1.75.2-windows-amd64.zip" -OutFile D:\rclone.zip
+          Expand-Archive -Path D:\rclone.zip -DestinationPath D:\ -Force
+          Move-Item D:\rclone-v1.75.2-windows-amd64 D:\rclone
+          Set-Content -Path $env:RCLONE_CONFIG -Value $env:RCLONE_CONF
+          & D:\rclone\rclone.exe mkdir backup:persist
+          & D:\rclone\rclone.exe mkdir backup:profile
+          & D:\rclone\rclone.exe copy backup:persist D:\persist
+          if ($LASTEXITCODE -ne 0) { Write-Error "rclone returned $LASTEXITCODE"; exit 1 }
+          icacls D:\persist /setowner run /T /C /Q | Out-Null
+          & D:\rclone\rclone.exe copy backup:profile D:\backup
+          if ($LASTEXITCODE -ne 0) { Write-Error "rclone returned $LASTEXITCODE"; exit 1 }
+          if (Test-Path D:\backup\profile.7z) {
+            Add-Type -Namespace Win32 -Name Profile -MemberDefinition '[DllImport("userenv.dll", CharSet = CharSet.Unicode)] public static extern int CreateProfile(string sid, string name, System.Text.StringBuilder path, uint size);'
+            $hr = [Win32.Profile]::CreateProfile(([Security.Principal.NTAccount]"$env:COMPUTERNAME\run").Translate([Security.Principal.SecurityIdentifier]).Value, "run", (New-Object Text.StringBuilder 260), 260)
+            if ($hr -ne 0 -and $hr -ne -2147024713) { Write-Error "CreateProfile returned $hr"; exit 1 }
+            & "$env:ProgramFiles\7-Zip\7z.exe" x D:\backup\profile.7z -oC:\ -y -bd "-p$env:RUN_PASSWORD"
+            if ($LASTEXITCODE -gt 1) { Write-Error "7-Zip returned $LASTEXITCODE"; exit 1 }
+            icacls C:\Users\run /setowner run /T /C /Q | Out-Null
+            Write-Host "Previous backup restored"
+          } else { Write-Host "No previous backup found" }
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi" -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+          $tokenBody = "client_id=$([uri]::EscapeDataString($env:TS_OAUTH_CLIENT_ID))&client_secret=$([uri]::EscapeDataString($env:TS_OAUTH_CLIENT_SECRET))"
+          $tokenResp = Invoke-RestMethod -Method Post -Uri "https://api.tailscale.com/api/v2/oauth/token" -ContentType "application/x-www-form-urlencoded" -Body $tokenBody
+          Write-Host "::add-mask::$($tokenResp.access_token)"
+          $keyBody = @{ capabilities = @{ devices = @{ create = @{ reusable = $false; ephemeral = $true; preauthorized = $true; tags = @("tag:ci") } } }; expirySeconds = 3600 } | ConvertTo-Json -Depth 5
+          $keyResp = Invoke-RestMethod -Method Post -Uri "https://api.tailscale.com/api/v2/tailnet/-/keys" -Headers @{ Authorization = "Bearer $($tokenResp.access_token)" } -ContentType "application/json" -Body $keyBody
+          Write-Host "::add-mask::$($keyResp.key)"
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$($keyResp.key) --hostname=gh-runner-$env:GITHUB_RUN_ID
+          $tsIP = $null; $retries = 0
+          while (-not $tsIP -and $retries -lt 10) { $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4; Start-Sleep -Seconds 5; $retries++ }
+          if (-not $tsIP) { Write-Error "Tailscale IP not assigned"; exit 1 }
+          $test = Test-NetConnection -ComputerName $tsIP -Port 3389
+          if (-not $test.TcpTestSucceeded) { Write-Error "Port not reachable"; exit 1 }
+          Write-Host "=== READY ==="
+          New-Item C:\ready.flag -Force | Out-Null
+          while ((Get-Date) -lt $deadline) { Write-Host "[$(Get-Date)] Active"; Start-Sleep -Seconds ([Math]::Max(1, [Math]::Min(300, [int]($deadline - (Get-Date)).TotalSeconds))) }
+          Write-Host "Time is up, saving your data"
+          exit 0
+      - name: backup
+        if: always()
+        run: |
+          if (-not (Test-Path C:\ready.flag)) { Write-Host "No session to back up"; exit 0 }
+          quser 2>$null | ForEach-Object { if ($_ -match '^[\s>]*run\s+(?:\S+\s+)?(\d+)\s+(?:Active|Disc)') { logoff $Matches[1] } }
+          Start-Sleep -Seconds 10
+          Remove-Item D:\backup -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path D:\backup | Out-Null
+          Set-Location C:\
+          & "$env:ProgramFiles\7-Zip\7z.exe" a -t7z -mx=1 -mhe=on -bd "-p$env:RUN_PASSWORD" D:\backup\profile.7z Users\run "-xr!NTUSER.DAT*" "-xr!UsrClass.dat*" "-x!Users\run\AppData\Local\Temp\*"
+          if ($LASTEXITCODE -gt 1) { Write-Error "7-Zip returned $LASTEXITCODE"; exit 1 }
+          & D:\rclone\rclone.exe copy D:\backup backup:profile
+          if ($LASTEXITCODE -ne 0) { Write-Error "rclone returned $LASTEXITCODE"; exit 1 }
+          & D:\rclone\rclone.exe copy D:\persist backup:persist
+          if ($LASTEXITCODE -ne 0) { Write-Error "rclone returned $LASTEXITCODE"; exit 1 }
+          exit 0
